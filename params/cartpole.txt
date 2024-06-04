@@ -1,0 +1,21 @@
+hparams = {
+    "env_name": 'Acrobot-v1',
+    
+    # Expert
+    "total_expert_timesteps": 100000, # no. of timesteps to train the expert
+    "num_expert_trajectories": 50, # no. of trajectories to collect from the trained expert
+    
+    # Encoder
+    "latent_dim": 64,
+    "hidden_dim": 256,
+    "encoder_epochs": 10, # no. of epochs to train the encoder inside each PCIL epoch
+    "encoder_lr": 1e-4, # learning rate
+    
+    # InfoNCE Loss
+    "batch_size": 128, # number of negative samples
+    "expert_data_ratio": 0.5, # number of positive samples as fraction of negative samples
+    
+    # Agent
+    "epochs": 20, # no. of epochs for the PCIL algorithm
+    "learning_steps": 1000 # no. of agent updates (using PPO) in each epoch
+}
