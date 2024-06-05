@@ -31,15 +31,15 @@ algos = {
 def train_expert(env_name, training_algo, total_expert_timesteps):
     
     env = DummyVecEnv([make_env(env_name)])
-    #env.seed(SEED)
-    expert = algos[training_algo]("MlpPolicy", env, verbose=0, tensorboard_log=f"runs/{run.id}", seed=SEED)
+    env.seed(SEED)
+    expert = algos[training_algo]("MlpPolicy", env, verbose=0, tensorboard_log=f"runsBC/{run.id}", seed=SEED)
     
     expert.learn(
         total_timesteps=total_expert_timesteps, 
         progress_bar=True, 
         callback=WandbCallback(
             gradient_save_freq=100,
-            model_save_path=f"models/{run.id}",
+            model_save_path=f"modelsBC/{run.id}",
             verbose=2,
         )
     )
@@ -50,16 +50,21 @@ def train_expert(env_name, training_algo, total_expert_timesteps):
 
 def collect_trajectories(env, policy, n_episodes=10):
     env = DummyVecEnv([make_env(env.unwrapped.spec.id)])
-    #env.seed(SEED)
+    env.seed(SEED)
     expert_data = []
     for _ in range(n_episodes):
-        obs = env.reset(seed = SEED)
+        obs = env.reset()
         done = False
         while not done:
             action, _ = policy.predict(obs)
             next_obs, reward, done, info = env.step(action)
             
-            x = np.concatenate((obs[0], next_obs[0])) # x = (s, s')
+            x = []
+            x.append([obs[0]])
+            x.append([action])
+            x.append([next_obs[0]])
+            x = np.array(x)
+            #x = np.concatenate((obs[0], next_obs[0])) # x = (s, s')
             expert_data.append(x)
             
             obs = next_obs
@@ -75,24 +80,24 @@ torch.backends.cudnn.deterministic = True
 np.random.seed(SEED)
 random.seed(SEED)
 
-env_name = "MountainCarContinuous-v0"
+env_name = "Pendulum-v1"
 env = gym.make(env_name)
 
-training_algo = "DDPG"
+training_algo = "SAC"
 
-expert_policy_path = f"experts/expert_{env_name}_{training_algo}.policy"
+expert_policy_path = f"experts/expertBC_{env_name}_{training_algo}.policy"
 
 run = wandb.init(
     project="imitation-learning",
     group=f"Experts",
-    name=f"{env_name}_{training_algo}_seed_{SEED}_{str(time.time())}",
+    name=f"{env_name}_{training_algo}_seedBC_{SEED}_{str(time.time())}",
     sync_tensorboard=True,
     monitor_gym=True,
 )
 
 
-expert = train_expert(env_name, training_algo=training_algo, total_expert_timesteps=100_000)
+expert = train_expert(env_name, training_algo=training_algo, total_expert_timesteps=100000)
 expert.save(expert_policy_path)
 
-expert_data = collect_trajectories(env, expert, 100)
-np.save(f"expert_data/{env_name}_{training_algo}.npy", np.array(expert_data))
+expert_data = collect_trajectories(env, expert, 1000)
+np.save(f"expert_data/{env_name}_{training_algo}_bcStyle.npy", np.array(expert_data))
