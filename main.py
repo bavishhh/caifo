@@ -6,7 +6,7 @@ import torch.optim as optim
 import numpy as np
 import random
 from collections import deque
-from stable_baselines3 import PPO, DDPG
+from stable_baselines3 import PPO, DDPG, SAC
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
@@ -14,6 +14,7 @@ import wandb
 import time
 import os
 from functools import partial
+from info_nce import InfoNCE
 
 SEED = 0
 torch.manual_seed(SEED)
@@ -22,7 +23,7 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 hparams = {
-    "env_name": 'CartPole-v1',   
+    "env_name": 'LunarLander-v2',   
     
     # Expert
     "total_expert_timesteps": 100000, # no. of timesteps to train the expert
@@ -32,24 +33,36 @@ hparams = {
     # Encoder
     "latent_dim": 64,
     "hidden_dim": 256,
-    "encoder_epochs": 10, # no. of epochs to train the encoder inside each PCIL epoch
-    "encoder_lr": 5e-4, # learning rate
+    "encoder_epochs": 100, # no. of epochs to train the encoder inside each PCIL epoch
+    "encoder_lr": 0.00001, # learning rate
     
     # InfoNCE Loss
     "batch_size": 128, # number of negative samples
     "expert_data_ratio": 0.5, # number of positive samples as fraction of negative samples
     
     # Agent
-    "epochs": 20, # no. of epochs for the PCIL algorithm
-    "learning_steps": 1000, # no. of agent updates (using PPO) in each epoch
+    "epochs": 1000, # no. of epochs for the PCIL algorithm
+    "learning_steps": 500, # no. of agent updates (using PPO) in each epoch
     "num_agent_trajectories": 10,
     "agent_algo": "PPO",
-    "entropy_coeff": 0.001, # entropy coefficient for PPO
+    "entropy_coeff": 0.01, # entropy coefficient for PPO
 }
 
+# optimal parameters can be found at https://github.com/DLR-RM/rl-baselines3-zoo/tree/master/hyperparams
 algos = {
-    "PPO": partial(PPO, policy="MlpPolicy", verbose=0, ent_coef=hparams["entropy_coeff"], seed=SEED),
-    "DDPG": partial(DDPG, policy="MlpPolicy", verbose=0, seed=SEED)
+    "PPO": partial(PPO, policy="MlpPolicy",
+                    n_steps = 1024,
+                    batch_size = 64,
+                    n_epochs = 4,
+                    ent_coef = 0.01,
+                    learning_rate = 1e-3,
+                    clip_range = 0.2,
+                    gae_lambda = 0.98,
+                    gamma=0.999,
+                    verbose=0, 
+                    seed=SEED),
+    "DDPG": partial(DDPG, policy="MlpPolicy", verbose=0, seed=SEED),
+    "SAC": partial(SAC, policy="MlpPolicy", learning_rate=1e-3, verbose=0, seed=SEED)
 }
 
 class PCILEnv(gym.Wrapper):
@@ -66,12 +79,17 @@ class PCILEnv(gym.Wrapper):
         
         assert self.curr_obs is not None
         x_agent = np.concatenate((self.curr_obs[0], next_obs))
+        
+        # randomly sample a transition from agent buffer.
         x_expert = random.choice(self.expert_buffer)
         
         x_expert = torch.FloatTensor(x_expert).to(device)
         x_agent = torch.FloatTensor(x_agent).to(device)
         
-        reward = pcil_reward(self.encoder, x_expert, x_agent)
+        expert_rep = self.encoder(x_expert)
+        agent_rep = self.encoder(x_agent)
+        
+        reward =  torch.cosine_similarity(expert_rep, agent_rep, dim=-1).item()
         
         self.step_counter += 1
         
@@ -133,39 +151,6 @@ def collect_trajectories(env, policy, n_episodes=10):
     return data
 
 
-def infoNCE_loss(anchor, positive, negatives, temperature=0.07):
-    if anchor.dim() == 1:
-        anchor = anchor.unsqueeze(0)
-    if positive.dim() == 1:
-        positive = positive.unsqueeze(0)
-    if negatives.dim() == 2:
-        negatives = negatives.unsqueeze(1)
-
-    # Compute similarities
-    pos_sim = torch.exp(torch.cosine_similarity(anchor, positive, dim=1) / temperature)
-    
-    # Reshape for broadcasting: (batch_size, 1, latent_dim) and (1, num_negatives, latent_dim)
-    anchor_expanded = anchor.unsqueeze(1)
-    negatives_expanded = negatives.transpose(0, 1)
-    
-    # Compute pairwise cosine similarities: (batch_size, num_negatives)
-    neg_sims = torch.cosine_similarity(anchor_expanded, negatives_expanded, dim=2)
-    neg_sims = torch.exp(neg_sims / temperature)
-    
-    # Sum over negative samples
-    denominator = pos_sim + neg_sims.sum(dim=1)
-    
-    # Compute loss
-    loss = -torch.log(pos_sim / denominator)
-    return loss.mean()
-
-
-def pcil_reward(encoder, expert_state, agent_state):
-    expert_rep = encoder(expert_state)
-    agent_rep = encoder(agent_state)
-    return torch.cosine_similarity(expert_rep, agent_rep, dim=-1).item()
-
-
 def pcil(env, expert_data):
     
     obs = env.reset(seed=SEED)
@@ -175,7 +160,8 @@ def pcil(env, expert_data):
     encoder = Encoder(state_dim, hparams["hidden_dim"], hparams["latent_dim"])
     encoder.to(device)
     
-    encoder_optimizer = optim.SGD(encoder.parameters(), lr=hparams["encoder_lr"])
+    criterion = InfoNCE()
+    encoder_optimizer = optim.AdamW(encoder.parameters(), lr=hparams["encoder_lr"])
 
     agent_buffer = deque(maxlen=10000)
     
@@ -187,12 +173,13 @@ def pcil(env, expert_data):
     for epoch in range(hparams["epochs"]):
         
         # Collect agent trajectories
-        agent_buffer.extend(collect_trajectories(env, imitation_agent, n_episodes=hparams["num_agent_trajectories"]))
+        trajectories = collect_trajectories(env, imitation_agent, n_episodes=hparams["num_agent_trajectories"])
+        agent_buffer.extend(trajectories)
         
         # Train encoder
         for _ in range(hparams["encoder_epochs"]): 
             
-            anchors = random.sample(expert_data, 1)
+            anchors = random.sample(expert_data,  int(hparams["expert_data_ratio"]*hparams["batch_size"]))
             positives = random.sample(expert_data, int(hparams["expert_data_ratio"]*hparams["batch_size"]))
             negatives = random.sample(agent_buffer, hparams["batch_size"])
             
@@ -200,12 +187,14 @@ def pcil(env, expert_data):
             positives = torch.stack(list(map(torch.FloatTensor, positives))).to(device)
             negatives = torch.stack(list(map(torch.FloatTensor, negatives))).to(device)
 
+            encoder_optimizer.zero_grad()
+            
             anchor_reps = encoder(anchors)
             positive_reps = encoder(positives)
-            negatives_reps = encoder(negatives)
+            negative_reps = encoder(negatives)
             
-            loss = infoNCE_loss(anchor_reps, positive_reps, negatives_reps)
-            encoder_optimizer.zero_grad()
+            # loss = infoNCE_loss(anchor_reps, positive_reps, negatives_reps)
+            loss = criterion(anchor_reps, positive_reps, negative_reps)
             loss.backward()
             encoder_optimizer.step()
             
@@ -238,7 +227,7 @@ env = Monitor(env)
 run = wandb.init(
     project="imitation-learning",
     group=f"{env_name}-{hparams['agent_algo']}",
-    name=f"seed_{SEED}_{str(time.time())}",
+    name=f"seed_{SEED}_InfoNCE_{str(time.time())}",
     sync_tensorboard=True,
     monitor_gym=True,
     config={

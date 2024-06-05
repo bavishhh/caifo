@@ -72,10 +72,10 @@ torch.backends.cudnn.deterministic = True
 np.random.seed(SEED)
 random.seed(SEED)
 
-env_name = "Ant-v4"
+env_name = "LunarLander-v2"
 env = gym.make(env_name)
 
-training_algo = "SAC"
+training_algo = "PPO"
 
 expert_policy_path = f"experts/expert_{env_name}_{training_algo}.policy"
 
@@ -91,5 +91,5 @@ run = wandb.init(
 expert = train_expert(env_name, training_algo=training_algo, total_expert_timesteps=1_000_000)
 expert.save(expert_policy_path)
 
-expert_data = collect_trajectories(env, expert, 50)
+expert_data = collect_trajectories(env, expert, 100)
 np.save(f"expert_data/{env_name}_{training_algo}.npy", np.array(expert_data))
