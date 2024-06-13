@@ -1,9 +1,10 @@
 hparams = {
-    "env_name": 'Acrobot-v1',
+    "env_name": 'CartPole-v1',   
     
     # Expert
     "total_expert_timesteps": 100000, # no. of timesteps to train the expert
     "num_expert_trajectories": 50, # no. of trajectories to collect from the trained expert
+    "expert_algo": "PPO",
     
     # Encoder
     "latent_dim": 64,
@@ -16,6 +17,8 @@ hparams = {
     "expert_data_ratio": 0.5, # number of positive samples as fraction of negative samples
     
     # Agent
-    "epochs": 20, # no. of epochs for the PCIL algorithm
-    "learning_steps": 1000 # no. of agent updates (using PPO) in each epoch
+    "epochs": 50, # no. of epochs for the PCIL algorithm
+    "learning_steps": 1000, # no. of agent updates (using PPO) in each epoch
+    "num_agent_trajectories": 10,
+    "agent_algo": "PPO",
 }

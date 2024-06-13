@@ -1,5 +1,7 @@
 models/
+modelsBC/
 runs/
+runsBC/
 wandb/
 
 __pycache__/

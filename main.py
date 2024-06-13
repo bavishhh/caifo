@@ -15,6 +15,9 @@ import time
 import os
 from functools import partial
 from info_nce import InfoNCE
+import umap
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 
 SEED = 0
 torch.manual_seed(SEED)
@@ -23,46 +26,47 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 hparams = {
-    "env_name": 'LunarLander-v2',   
+    "env_name": 'Pendulum-v1',   
     
     # Expert
     "total_expert_timesteps": 100000, # no. of timesteps to train the expert
     "num_expert_trajectories": 50, # no. of trajectories to collect from the trained expert
-    "expert_algo": "PPO",
+    "expert_algo": "SAC",
     
     # Encoder
     "latent_dim": 64,
     "hidden_dim": 256,
     "encoder_epochs": 100, # no. of epochs to train the encoder inside each PCIL epoch
-    "encoder_lr": 0.00001, # learning rate
+    "encoder_lr": 0.01, # learning rate
     
     # InfoNCE Loss
     "batch_size": 128, # number of negative samples
     "expert_data_ratio": 0.5, # number of positive samples as fraction of negative samples
     
     # Agent
-    "epochs": 1000, # no. of epochs for the PCIL algorithm
+    "epochs": 50, # no. of epochs for the PCIL algorithm
     "learning_steps": 500, # no. of agent updates (using PPO) in each epoch
     "num_agent_trajectories": 10,
-    "agent_algo": "PPO",
-    "entropy_coeff": 0.01, # entropy coefficient for PPO
+    "agent_algo": "SAC",
+    
+    "pca_num_points": 200,
 }
 
 # optimal parameters can be found at https://github.com/DLR-RM/rl-baselines3-zoo/tree/master/hyperparams
 algos = {
     "PPO": partial(PPO, policy="MlpPolicy",
-                    n_steps = 1024,
-                    batch_size = 64,
-                    n_epochs = 4,
-                    ent_coef = 0.01,
-                    learning_rate = 1e-3,
-                    clip_range = 0.2,
-                    gae_lambda = 0.98,
-                    gamma=0.999,
+                    # n_steps = 1024,
+                    # batch_size = 128,
+                    # n_epochs = 20,
+                    # ent_coef = 0.0,
+                    # learning_rate = 0.001,
+                    # clip_range = 0.2,
+                    # gae_lambda = 0.8,
+                    # gamma=0.98,
                     verbose=0, 
                     seed=SEED),
     "DDPG": partial(DDPG, policy="MlpPolicy", verbose=0, seed=SEED),
-    "SAC": partial(SAC, policy="MlpPolicy", learning_rate=1e-3, verbose=0, seed=SEED)
+    "SAC": partial(SAC, policy="MlpPolicy", verbose=0, ent_coef=0.01, seed=SEED)
 }
 
 class PCILEnv(gym.Wrapper):
@@ -90,6 +94,7 @@ class PCILEnv(gym.Wrapper):
         agent_rep = self.encoder(x_agent)
         
         reward =  torch.cosine_similarity(expert_rep, agent_rep, dim=-1).item()
+        # reward = -torch.sqrt(torch.sum(torch.pow(expert_rep - agent_rep, 2), dim=0))  
         
         self.step_counter += 1
         
@@ -108,11 +113,11 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(2*state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, output_dim)
         )
 
@@ -161,9 +166,9 @@ def pcil(env, expert_data):
     encoder.to(device)
     
     criterion = InfoNCE()
-    encoder_optimizer = optim.AdamW(encoder.parameters(), lr=hparams["encoder_lr"])
+    encoder_optimizer = optim.AdamW(encoder.parameters(), lr=hparams["encoder_lr"], betas=(0.9, 0.9))
 
-    agent_buffer = deque(maxlen=10000)
+    agent_buffer = deque(maxlen=5000)
     
     pcil_env = PCILEnv(env, encoder, expert_data)
     imitation_agent = algos[hparams["agent_algo"]](env=pcil_env, device=device)
@@ -175,6 +180,12 @@ def pcil(env, expert_data):
         # Collect agent trajectories
         trajectories = collect_trajectories(env, imitation_agent, n_episodes=hparams["num_agent_trajectories"])
         agent_buffer.extend(trajectories)
+        
+        if epoch % 5 == 0:
+            with torch.no_grad():
+                expert_transitions = random.sample(expert_data, hparams["pca_num_points"])
+                agent_transitions = random.sample(trajectories, min(hparams["pca_num_points"], len(trajectories)))
+                plot_reps(encoder, expert_transitions, agent_transitions, "PCA_before")
         
         # Train encoder
         for _ in range(hparams["encoder_epochs"]): 
@@ -193,7 +204,6 @@ def pcil(env, expert_data):
             positive_reps = encoder(positives)
             negative_reps = encoder(negatives)
             
-            # loss = infoNCE_loss(anchor_reps, positive_reps, negatives_reps)
             loss = criterion(anchor_reps, positive_reps, negative_reps)
             loss.backward()
             encoder_optimizer.step()
@@ -204,6 +214,13 @@ def pcil(env, expert_data):
         # Update the env with trained encoder
         pcil_env.update_encoder(encoder)
         
+        
+        if epoch % 5 == 0:
+            with torch.no_grad():
+                expert_transitions = random.sample(expert_data, hparams["pca_num_points"])
+                agent_transitions = random.sample(agent_buffer, hparams["pca_num_points"])
+                plot_reps(encoder, expert_transitions, agent_transitions, "PCA_after")
+                
         # Train imitation agent
         imitation_agent.learn(total_timesteps=hparams["learning_steps"])
         
@@ -214,6 +231,28 @@ def pcil(env, expert_data):
         wandb.log({"imitator/mean_reward": mean_reward, "imitator/env_step": pcil_env.step_counter})
 
     return imitation_agent
+
+def plot_reps(encoder, expert_data, agent_data, name="PCA"):
+
+    expert_data = torch.stack(list(map(torch.FloatTensor, expert_data))).to(device)
+    agent_data = torch.stack(list(map(torch.FloatTensor, agent_data))).to(device)
+
+    expert_reps = encoder(expert_data)
+    agent_reps = encoder(agent_data)
+    
+    data = torch.concatenate([expert_reps, agent_reps]).cpu()
+    # result = umap.UMAP().fit_transform(data)
+    result = PCA(n_components=2).fit_transform(data)
+    labels = [1]*expert_data.size(0) + [0]*agent_data.size(0)
+    
+    plt.figure()
+    plt.scatter(result[:, 0], result[:, 1], c=labels)
+    wandb.log({f"{name}": plt})
+    
+    
+    
+    
+    
 
 # Main
 
@@ -226,8 +265,8 @@ env = Monitor(env)
 
 run = wandb.init(
     project="imitation-learning",
-    group=f"{env_name}-{hparams['agent_algo']}",
-    name=f"seed_{SEED}_InfoNCE_{str(time.time())}",
+    group="umap",
+    name=f"{env_name}_{hparams['agent_algo']}_seed_{SEED}_{str(time.time())}",
     sync_tensorboard=True,
     monitor_gym=True,
     config={
