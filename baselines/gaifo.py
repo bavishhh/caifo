@@ -1,5 +1,4 @@
 import gymnasium as gym
-import seals
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -196,7 +195,6 @@ def pcil(env, expert_data):
             anchor_reps = encoder(anchors)
             positive_reps = encoder(positives)
             negative_reps = encoder(negatives)
-            # loss = infoNCE_loss(anchor_reps, positive_reps, negatives_reps)
             positive_labels = torch.ones_like(positive_reps)
             negative_labels = torch.zeros_like(negative_reps)  
 
